@@ -609,32 +609,47 @@ export namespace Session {
     const previous = msgs.filter((x) => x.info.role === "assistant").at(-1)?.info as MessageV2.Assistant
     const outputLimit = Math.min(model.info.limit.output, OUTPUT_TOKEN_MAX) || OUTPUT_TOKEN_MAX
 
-    // Helper function to estimate token count for text content
-    function estimateTokens(text: string): number {
-      // Rough estimation: ~4 characters per token for most models
-      // This is conservative and works better for models with smaller context windows
-      return Math.ceil(text.length / 3.5)
+    // Helper function to count tokens accurately
+    async function countTokens(text: string): Promise<number> {
+      try {
+        // Try to use tiktoken for accurate counting if available
+        const tiktoken = await import("tiktoken").catch(() => null)
+        if (tiktoken) {
+          // Use cl100k_base encoding which works for most modern models (GPT-4, Claude, etc.)
+          const encoder = tiktoken.getEncoding("cl100k_base")
+          const tokens = encoder.encode(text)
+          encoder.free() // Free memory
+          return tokens.length
+        }
+      } catch (error) {
+        // Fall back to estimation if tiktoken fails
+        log.debug("tiktoken not available, using estimation", { error })
+      }
+      
+      // Fallback to character-based estimation (more conservative than before)
+      // Using 3.0 chars/token for better accuracy with smaller context models
+      return Math.ceil(text.length / 3.0)
     }
 
-    // Helper function to estimate total context tokens
-    function estimateContextTokens(): number {
+    // Helper function to count total context tokens
+    async function countContextTokens(): Promise<number> {
       let totalTokens = 0
 
       // Add system prompt tokens
       for (const systemText of system) {
-        totalTokens += estimateTokens(systemText)
+        totalTokens += await countTokens(systemText)
       }
 
       // Add conversation message tokens
       for (const msg of msgs) {
         for (const part of msg.parts) {
           if (part.type === "text") {
-            totalTokens += estimateTokens(part.text)
+            totalTokens += await countTokens(part.text)
           } else if (part.type === "file" && part.url.startsWith("data:text/plain")) {
-            // Estimate tokens for text files
+            // Count tokens for text files
             try {
               const textContent = Buffer.from(part.url.split(",")[1], "base64").toString()
-              totalTokens += estimateTokens(textContent)
+              totalTokens += await countTokens(textContent)
             } catch {
               // Fallback estimation for files
               totalTokens += 1000
@@ -646,22 +661,22 @@ export namespace Session {
       // Add current user input tokens
       for (const part of userParts) {
         if (part.type === "text") {
-          totalTokens += estimateTokens(part.text)
+          totalTokens += await countTokens(part.text)
         }
       }
 
       return totalTokens
     }
 
-    // Improved context length check using total estimated tokens
+    // Improved context length check using accurate token counting
     if (model.info.limit.context && model.info.limit.context > 0) {
-      const estimatedTokens = estimateContextTokens()
+      const actualTokens = await countContextTokens()
       const contextLimit = model.info.limit.context - outputLimit
       const threshold = Math.max(contextLimit * 0.8, 0) // Use 80% threshold to be more conservative
 
-      if (estimatedTokens > threshold) {
+      if (actualTokens > threshold) {
         log.info("Context limit approaching, triggering summarization", {
-          estimatedTokens,
+          actualTokens,
           contextLimit,
           threshold,
           modelID: input.modelID,
