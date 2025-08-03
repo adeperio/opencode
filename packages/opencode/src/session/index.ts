@@ -609,7 +609,73 @@ export namespace Session {
     const previous = msgs.filter((x) => x.info.role === "assistant").at(-1)?.info as MessageV2.Assistant
     const outputLimit = Math.min(model.info.limit.output, OUTPUT_TOKEN_MAX) || OUTPUT_TOKEN_MAX
 
-    // auto summarize if too long
+    // Helper function to estimate token count for text content
+    function estimateTokens(text: string): number {
+      // Rough estimation: ~4 characters per token for most models
+      // This is conservative and works better for models with smaller context windows
+      return Math.ceil(text.length / 3.5)
+    }
+
+    // Helper function to estimate total context tokens
+    function estimateContextTokens(): number {
+      let totalTokens = 0
+
+      // Add system prompt tokens
+      for (const systemText of system) {
+        totalTokens += estimateTokens(systemText)
+      }
+
+      // Add conversation message tokens
+      for (const msg of msgs) {
+        for (const part of msg.parts) {
+          if (part.type === "text") {
+            totalTokens += estimateTokens(part.text)
+          } else if (part.type === "file" && part.url.startsWith("data:text/plain")) {
+            // Estimate tokens for text files
+            try {
+              const textContent = Buffer.from(part.url.split(",")[1], "base64").toString()
+              totalTokens += estimateTokens(textContent)
+            } catch {
+              // Fallback estimation for files
+              totalTokens += 1000
+            }
+          }
+        }
+      }
+
+      // Add current user input tokens
+      for (const part of userParts) {
+        if (part.type === "text") {
+          totalTokens += estimateTokens(part.text)
+        }
+      }
+
+      return totalTokens
+    }
+
+    // Improved context length check using total estimated tokens
+    if (model.info.limit.context && model.info.limit.context > 0) {
+      const estimatedTokens = estimateContextTokens()
+      const contextLimit = model.info.limit.context - outputLimit
+      const threshold = Math.max(contextLimit * 0.8, 0) // Use 80% threshold to be more conservative
+
+      if (estimatedTokens > threshold) {
+        log.info("Context limit approaching, triggering summarization", {
+          estimatedTokens,
+          contextLimit,
+          threshold,
+          modelID: input.modelID,
+        })
+        await summarize({
+          sessionID: input.sessionID,
+          providerID: input.providerID,
+          modelID: input.modelID,
+        })
+        return chat(input)
+      }
+    }
+
+    // Fallback to original check for models where we have actual token counts
     if (previous && previous.tokens) {
       const tokens =
         previous.tokens.input + previous.tokens.cache.read + previous.tokens.cache.write + previous.tokens.output
